@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# det — thin wrapper around the determinism CLI for use from opencode
+# slash commands and the TUI `!` shell mode. Auto-builds bin/determinism
+# when missing, then execs it with the given arguments.
+set -euo pipefail
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+BIN="$REPO/bin/determinism"
+
+if [ ! -x "$BIN" ]; then
+  (
+    cd "$REPO"
+    if [ -x /programs/dev-lang/go/current/lib/go/bin/go ]; then
+      GOROOT=/programs/dev-lang/go/current/lib/go PATH="$PATH:/programs/dev-lang/go/current/lib/go/bin" \
+        /programs/dev-lang/go/current/lib/go/bin/go build -o bin/determinism ./cmd/determinism
+    elif command -v go >/dev/null 2>&1; then
+      env -u GOROOT go build -o bin/determinism ./cmd/determinism
+    else
+      echo "det: no Go toolchain found; cannot build determinism" >&2
+      exit 1
+    fi
+  )
+fi
+
+exec "$BIN" "$@"
