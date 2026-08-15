@@ -1,0 +1,14 @@
+{
+  "name": "determinism-opencode-plugin",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "opencode plugin exposing the determinism replay tool (list/plan/run/cache) as custom tools",
+  "dependencies": {
+    "@opencode-ai/plugin": "^1.2.6"
+  },
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "typescript": "^7.0.2"
+  }
+}

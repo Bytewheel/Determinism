@@ -85,6 +85,15 @@ determinism run dvpn-session --dangerous --allow-dir ~/Documents/hawksnestsoftwa
 - **Cache:** gzip-tar snapshots of a workdir keyed by session+workdir+prompt,
   restored before replay so prompts that need pre-existing data work.
 
+## opencode plugin
+
+`opencode/determinism.ts` exposes the CLI as opencode custom tools
+(`determinism_list`, `determinism_plan`, `determinism_run`, `determinism_cache`)
+so sessions can be planned and replayed from inside a chat. See
+`opencode/README.md` for setup (one-time `npm install` in `opencode/`, then a
+`plugin` entry in opencode config) — it resolves or auto-builds
+`bin/determinism`.
+
 ## Build
 
 ```sh
