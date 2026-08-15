@@ -56,6 +56,8 @@ async function ensureBinary($: any): Promise<string> {
 
 interface RunResult {
 	ok: boolean
+	stdout: string
+	stderr: string
 	text: string
 }
 
@@ -71,9 +73,56 @@ async function runDeterminism($: any, args: string[]): Promise<RunResult> {
 		const parts = [`determinism exited with code ${out.exitCode}`]
 		if (stdout) parts.push(stdout)
 		if (stderr) parts.push(stderr)
-		return { ok: false, text: parts.join("\n") }
+		return { ok: false, stdout, stderr, text: parts.join("\n") }
 	}
-	return { ok: true, text: stdout }
+	return { ok: true, stdout, stderr, text: stdout }
+}
+
+// referencedSiblingDirs runs the CLI's --dangerous --dry-run pre-pass to
+// discover which sibling directories (outside the session dir) the replay
+// would touch at their real paths. The non-interactive pre-pass never writes
+// anything; it only lists the dirs that require --allow-dir approval.
+async function referencedSiblingDirs($: any, baseArgs: string[]): Promise<string[]> {
+	const res = await runDeterminism($, [...baseArgs, "--dangerous", "--dry-run"])
+	if (!res.ok) {
+		throw new Error(`determinism --dangerous pre-pass failed:\n${res.text}`)
+	}
+	const dirs: string[] = []
+	for (const line of res.stderr.split("\n")) {
+		const m = /^ {2}(\S.*)$/.exec(line.trimEnd())
+		if (m && path.isAbsolute(m[1])) dirs.push(m[1])
+	}
+	return [...new Set(dirs)]
+}
+
+// promptSiblingAccess asks the user to approve real-path access to each
+// referenced sibling directory and returns the approved subset. The prompt
+// flows through opencode's permission system (external_directory), so the same
+// "once/always/reject" UI is used and approvals persist for the session.
+async function promptSiblingAccess(
+	context: { ask: (input: { permission: string; patterns: string[]; always: string[]; metadata: Record<string, unknown> }) => Promise<void> },
+	dirs: string[],
+): Promise<string[]> {
+	const approved: string[] = []
+	for (const dir of dirs) {
+		try {
+			await context.ask({
+				permission: "external_directory",
+				patterns: [path.join(dir, "*")],
+				always: [path.join(dir, "*")],
+				metadata: {
+					reason:
+						"determinism --dangerous replay accesses this sibling repo at its real path and may write to it",
+					filepath: dir,
+					parentDir: dir,
+				},
+			})
+			approved.push(dir)
+		} catch {
+			// user rejected access to this sibling
+		}
+	}
+	return approved
 }
 
 const sessionArg = tool.schema
@@ -131,7 +180,7 @@ export const DeterminismPlugin: Plugin = async ({ $ }) => {
 
 			determinism_run: tool({
 				description:
-					"Replay a session deterministically inside a sandbox: every bash command, write, edit, and apply_patch runs in order against copies under the sandbox, so the original project is never modified. Defaults to --dry-run (print actions, execute nothing); set dryRun=false to execute inside the sandbox. Sibling repos outside the session dir are snapshotted with cache, or accessed at their real paths with dangerous (pass allowDir to pre-approve; without it the run fails in this non-interactive context).",
+					"Replay a session deterministically inside a sandbox: every bash command, write, edit, and apply_patch runs in order against copies under the sandbox, so the original project is never modified. Defaults to --dry-run (print actions, execute nothing); set dryRun=false to execute inside the sandbox. Sibling repos outside the session dir are snapshotted with cache, or accessed at their real paths with dangerous. For dangerous (non-dry) runs the plugin first asks your permission for each referenced sibling repo (external_directory prompt), then passes the approved dirs as --allow-dir; rejected siblings are excluded and the run fails gracefully if none are approved.",
 				args: {
 					session: sessionArg,
 					dryRun: tool.schema
@@ -173,7 +222,7 @@ export const DeterminismPlugin: Plugin = async ({ $ }) => {
 						.describe("Cache directory (default ~/.cache/determinism)"),
 					db: dbArg,
 				},
-				async execute(args) {
+				async execute(args, context) {
 					const a = ["run", args.session]
 					if (args.dryRun) a.push("--dry-run")
 					if (args.cache) a.push("--cache")
@@ -184,6 +233,20 @@ export const DeterminismPlugin: Plugin = async ({ $ }) => {
 					if (args.rewriteDir) a.push("--rewrite-dir", args.rewriteDir)
 					if (args.cacheDir) a.push("--cache-dir", args.cacheDir)
 					if (args.db) a.push("--db", args.db)
+
+					if (args.dangerous && !args.dryRun) {
+						const dirs = await referencedSiblingDirs($, a)
+						if (dirs.length > 0) {
+							const approved = await promptSiblingAccess(context, dirs)
+							for (const d of approved) a.push("--allow-dir", d)
+							if (approved.length === 0) {
+								return `determinism: dangerous replay of "${args.session}" references sibling repos outside the sandbox, but you rejected access to all of them:\n${dirs
+									.map((d) => `  - ${d}`)
+									.join("\n")}\n\nNo real-path access allowed; run aborted. Use --cache to replay against snapshots instead, or re-run and approve at least one sibling.`
+							}
+						}
+					}
+
 					const res = await runDeterminism($, a)
 					return res.ok ? res.text : `determinism: ${res.text}`
 				},
