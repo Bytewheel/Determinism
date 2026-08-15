@@ -6,13 +6,17 @@ samples from the live `opencode.db`.
 
 ## 1. Chat text format
 
-Emitted by `formatTranscript` in `packages/tui/src/util/transcript.ts`.
-Line-oriented markdown; determinism parses it with a small state machine.
+Emitted by `formatTranscript` in `packages/tui/src/util/transcript.ts` and by
+`determinism export` (which extends it with a `**Directory:**` line). It
+round-trips through `ParseChatText`: an exported transcript reimports
+losslessly and can be hand-edited between the two steps. Line-oriented
+markdown; determinism parses it with a small state machine.
 
 ```
 # {title}
 
 **Session ID:** {id}
+**Directory:** {absolute working dir}      <- determinism export only
 **Created:** {locale string}
 **Updated:** {locale string}
 
@@ -58,8 +62,15 @@ Notes:
 - Fenced blocks immediately following `**Input:**`, `**Output:**`, or
   `**Error:**` carry that part's payload. Parsing is lenient about which
   block came first (`ParseToolPart` swaps if input doesn't parse as JSON).
+- Tool output is stored in the DB as a JSON string; `determinism export`
+  decodes it back to plain text so transcripts are human readable.
+- A fence line (```) inside a *text* part is literal text; fences only open
+  tool input/output blocks, so later tool parts stay intact.
 - The format has no timestamps; Determinism assigns synthetic monotonic
   timestamps per line to preserve order.
+- Known limitation (inherited from the transcript format): a tool *output*
+  containing a line that is exactly ``` ends the output fence early. Editing
+  such output is fine; reimporting it truncates at that line.
 
 ## 2. SQLite database
 

@@ -8,6 +8,7 @@ edit, delete, or overwrite the session performed, in the same order.
 ```
 determinism run <session|name|prompt|file.md> [flags]
 determinism plan <session|name|prompt|file.md> [--out plan.md]
+determinism export <session|name|prompt|file.md> [--out file]
 determinism list [--limit n]
 determinism cache save <key> <dir>
 determinism cache restore <key> <dir>
@@ -17,6 +18,24 @@ determinism cache list
 A session reference can be an opencode session id (`ses_...`), a session name
 (slug, e.g. `swift-pixel`), a title substring, the initial prompt text, or a
 path to a chat-text transcript (`.md`).
+
+## Export / edit / reimport
+
+`determinism export` writes a session to a chat-text markdown transcript that
+you can edit by hand and reimport — `run` and `plan` accept the `.md` path as a
+session reference. The transcript preserves the session directory and every
+tool call (bash command, file path, patch) as readable text:
+
+```sh
+# Export a session to ./swift-pixel.md
+determinism export swift-pixel
+
+# Or to a specific file (--out - prints to stdout)
+determinism export swift-pixel --out sessions/swift-pixel.md
+
+# Edit the file by hand, then reimport and replay (dry-run shown)
+determinism run sessions/swift-pixel.md --dry-run
+```
 
 ## Examples
 
@@ -61,7 +80,7 @@ determinism run dvpn-session --dangerous --allow-dir ~/Documents/hawksnestsoftwa
 | `--allow-dir path` | pre-approve a sibling repo for `--dangerous` (repeatable) |
 | `--strict`     | stop at first failure instead of failing gracefully        |
 | `--shell path` | shell for bash replay (default `/bin/sh`)                  |
-| `--out file`   | write a plan to a file (`plan`)                            |
+| `--out file`   | write a plan to a file (`plan`) or write the transcript to a file (`export`, default `<slug>.md`, `-` for stdout) |
 
 ## How it works
 
@@ -88,8 +107,9 @@ determinism run dvpn-session --dangerous --allow-dir ~/Documents/hawksnestsoftwa
 ## opencode plugin
 
 `opencode/determinism.ts` exposes the CLI as opencode custom tools
-(`determinism_list`, `determinism_plan`, `determinism_run`, `determinism_cache`)
-so sessions can be planned and replayed from inside a chat. See
+(`determinism_list`, `determinism_plan`, `determinism_run`, `determinism_export`,
+`determinism_cache`) so sessions can be planned, exported, and replayed from
+inside a chat. See
 `opencode/README.md` for setup (one-time `npm install` in `opencode/`, then a
 `plugin` entry in opencode config) — it resolves or auto-builds
 `bin/determinism`.

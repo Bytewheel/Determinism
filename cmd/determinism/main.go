@@ -5,6 +5,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -32,6 +33,7 @@ func usage() {
 Usage:
   determinism run <session|name|prompt|file.md> [flags]
   determinism plan <session|name|prompt|file.md> [flags]
+  determinism export <session|name|prompt|file.md> [--out file] [--db path]
   determinism list [--db path] [--limit n]
   determinism cache save <key> <dir> [--cache-dir path]
   determinism cache restore <key> <dir> [--cache-dir path]
@@ -59,7 +61,8 @@ Flags:
   --subprompts       execute subprompts (task/subagent sessions)
   --strict           stop at the first failure instead of failing gracefully
   --shell path       shell used for bash replay (default /bin/sh)
-  --out file         write plan to a file (plan command)
+  --out file         write plan to a file (plan) or write the transcript to a
+                     file (export; default <slug>.md, use '-' for stdout)
 `)
 }
 
@@ -180,6 +183,21 @@ func run(args []string) error {
 			return runPlan(ref, o)
 		}
 		return runReplay(ref, o)
+
+	case "export":
+		if len(rest) < 1 {
+			usage()
+			return fmt.Errorf("export requires a session reference")
+		}
+		o, pos, err := parseFlags(rest[1:])
+		if err != nil {
+			return err
+		}
+		ref := rest[0]
+		if len(pos) > 0 {
+			ref = pos[0]
+		}
+		return runExport(ref, o)
 
 	case "list":
 		o, _, err := parseFlags(rest)
@@ -491,6 +509,44 @@ func runPlan(ref string, o opts) error {
 	}
 	fmt.Print(md)
 	fmt.Printf("\n(source: %s)\n", src)
+	return nil
+}
+
+// runExport writes a session to a chat-text markdown transcript that can be
+// edited by hand and reimported via `run`/`plan <file.md>`.
+func runExport(ref string, o opts) error {
+	s, src, err := loadSession(ref, o)
+	if err != nil {
+		return err
+	}
+	var buf bytes.Buffer
+	if err := session.WriteChatText(&buf, s); err != nil {
+		return err
+	}
+	out := o.out
+	if out == "" {
+		out = s.Slug
+		if out == "" {
+			out = s.ID
+		}
+		if out == "" {
+			out = "session"
+		}
+		out += ".md"
+	}
+	if out == "-" {
+		fmt.Print(buf.String())
+		return nil
+	}
+	if err := os.WriteFile(out, buf.Bytes(), 0o644); err != nil {
+		return err
+	}
+	n := 0
+	for _, m := range s.Messages {
+		n += len(m.Parts)
+	}
+	fmt.Printf("exported %d messages / %d parts to %s (source: %s)\n", len(s.Messages), n, out, src)
+	fmt.Printf("edit %s by hand, then reimport with: determinism run %s\n", out, out)
 	return nil
 }
 

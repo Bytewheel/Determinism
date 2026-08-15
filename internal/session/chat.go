@@ -87,10 +87,14 @@ func parseChatText(data []byte) (*Session, error) {
 			case curPart != nil && curPart.Type == "tool" && curPart.Output == nil:
 				mode = modeFenceOutput
 			default:
-				// stray fence (e.g. markdown in a text part) — treat as text
-				mode = modeFenceOutput
+				// A fence outside a tool part is literal text (e.g. a markdown
+				// code block in a text/reasoning part). Fall through to the
+				// plain content handling below so the rest of the transcript
+				// stays structurally intact.
 			}
-			continue
+			if mode == modeFenceInput || mode == modeFenceOutput || mode == modeFenceError {
+				continue
+			}
 		}
 
 		// Inside a fenced block: capture raw content.
@@ -122,6 +126,11 @@ func parseChatText(data []byte) (*Session, error) {
 
 		case strings.HasPrefix(trimmed, "**Session ID:**"):
 			s.ID = strings.TrimSpace(strings.TrimPrefix(trimmed, "**Session ID:**"))
+			setMode(modeNone)
+			continue
+
+		case strings.HasPrefix(trimmed, "**Directory:**"):
+			s.Directory = strings.TrimSpace(strings.TrimPrefix(trimmed, "**Directory:**"))
 			setMode(modeNone)
 			continue
 

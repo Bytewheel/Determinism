@@ -6,6 +6,7 @@
 //   - determinism_list  — list sessions determinism can replay
 //   - determinism_plan  — build an implementation plan from a session
 //   - determinism_run   — replay a session inside a sandbox
+//   - determinism_export — export a session to an editable chat-text transcript
 //   - determinism_cache — manage compressed filesystem/repository snapshots
 //
 // The plugin locates the determinism binary via DETERMINISM_BIN, then the
@@ -247,6 +248,26 @@ export const DeterminismPlugin: Plugin = async ({ $ }) => {
 						}
 					}
 
+					const res = await runDeterminism($, a)
+					return res.ok ? res.text : `determinism: ${res.text}`
+				},
+			}),
+
+			determinism_export: tool({
+				description:
+					"Export a session to a chat-text markdown transcript that can be edited by hand and reimported (determinism_run and determinism_plan accept the .md path as the session reference). The exported file preserves the session directory and every tool call (bash command, file path, patch) as editable text.",
+				args: {
+					session: sessionArg,
+					out: tool.schema
+						.string()
+						.optional()
+						.describe("Output file path (default <slug>.md in the current directory)"),
+					db: dbArg,
+				},
+				async execute(args) {
+					const a = ["export", args.session]
+					if (args.out) a.push("--out", args.out)
+					if (args.db) a.push("--db", args.db)
 					const res = await runDeterminism($, a)
 					return res.ok ? res.text : `determinism: ${res.text}`
 				},
