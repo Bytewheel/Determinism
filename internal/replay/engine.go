@@ -59,6 +59,9 @@ type Engine struct {
 	// WorkDir is the base directory commands run in and where relative paths
 	// resolve. If empty, defaults to the session's directory.
 	WorkDir string
+	// Rewrite, when non-nil, remaps absolute paths recorded in the session
+	// into a sandbox so replay writes are contained (see Rewriter).
+	Rewrite *Rewriter
 	// Shell is the shell used for bash tool replays. Defaults to /bin/sh.
 	Shell string
 	// Subprompts enables execution of task/subtask subprompt sessions.
@@ -96,6 +99,19 @@ func (e *Engine) shell() string {
 	return "/bin/sh"
 }
 
+// resolvePath resolves a recorded path to a filesystem path. When a Rewriter
+// is configured, absolute paths are sandboxed; otherwise absolute paths are
+// honored as-is (mirroring the session's original layout).
+func (e *Engine) resolvePath(p string) (string, error) {
+	if e.Rewrite != nil {
+		return e.Rewrite.Resolve(p)
+	}
+	if filepath.IsAbs(p) {
+		return p, nil
+	}
+	return filepath.Join(e.WorkDir, p), nil
+}
+
 // Replay runs the session and returns a report. If FailGracefully is true
 // (default) all actions are attempted and failures are collected.
 func (e *Engine) Replay(s *session.Session) (*Report, error) {
@@ -116,6 +132,11 @@ func (e *Engine) Replay(s *session.Session) (*Report, error) {
 		for i := range m.Parts {
 			p := &m.Parts[i]
 			out := e.replayPart(s, m, p)
+			if e.Rewrite != nil {
+				if err := e.Rewrite.SyncSiblings(); err != nil {
+					e.log("  !! sibling cache sync: %v", err)
+				}
+			}
 			rep.Outcomes = append(rep.Outcomes, out)
 			if !out.OK && !e.FailGracefully {
 				return rep, fmt.Errorf("replay aborted at part %s: %s", p.ID, out.Error)
@@ -174,21 +195,40 @@ func (e *Engine) replayBash(s *session.Session, m session.Message, p *session.Pa
 	}
 	dir := e.WorkDir
 	if input.Workdir != "" {
-		dir = resolve(e.WorkDir, input.Workdir)
+		var err error
+		dir, err = e.resolvePath(input.Workdir)
+		if err != nil {
+			o.OK = false
+			o.Error = err.Error()
+			return o
+		}
 	}
 	o.Summary = truncate(input.Command, 100)
+	command := input.Command
+	if e.Rewrite != nil {
+		rewritten, err := e.Rewrite.RewriteCommand(input.Command)
+		if err != nil {
+			o.OK = false
+			o.Error = err.Error()
+			return o
+		}
+		command = rewritten
+	}
 	if e.DryRun {
 		e.log("dry-run bash: %s", input.Command)
+		if command != input.Command {
+			e.log("        sandbox: %s", command)
+		}
 		return o
 	}
-	e.log("$ %s", input.Command)
+	e.log("$ %s", command)
 
 	ctx := time.After(10 * time.Minute)
 	if input.Timeout > 0 {
 		ctx = time.After(time.Duration(input.Timeout) * time.Millisecond)
 	}
 
-	cmd := exec.Command(e.shell(), "-c", input.Command)
+	cmd := exec.Command(e.shell(), "-c", command)
 	cmd.Dir = dir
 	var buf bytes.Buffer
 	cmd.Stdout = &buf
@@ -239,7 +279,12 @@ func (e *Engine) replayWrite(s *session.Session, p *session.Part, o Outcome) Out
 		o.Error = "write input has no file path"
 		return o
 	}
-	abs := resolve(e.WorkDir, target)
+	abs, err := e.resolvePath(target)
+	if err != nil {
+		o.OK = false
+		o.Error = err.Error()
+		return o
+	}
 	o.Summary = target
 	if e.DryRun {
 		e.log("dry-run write: %s (%d bytes)", target, len(input.Content))
@@ -275,7 +320,12 @@ func (e *Engine) replayEdit(s *session.Session, p *session.Part, o Outcome) Outc
 		o.Error = "edit input has no file path"
 		return o
 	}
-	abs := resolve(e.WorkDir, target)
+	abs, err := e.resolvePath(target)
+	if err != nil {
+		o.OK = false
+		o.Error = err.Error()
+		return o
+	}
 	o.Summary = target
 	if e.DryRun {
 		e.log("dry-run edit: %s", target)
@@ -325,7 +375,7 @@ func (e *Engine) replayApplyPatch(s *session.Session, p *session.Part, o Outcome
 		e.log("dry-run apply_patch (%d chars)", len(input.PatchText))
 		return o
 	}
-	ops, err := ApplyPatch(e.WorkDir, input.PatchText)
+	ops, err := ApplyPatchResolved(e.WorkDir, input.PatchText, e.resolvePath)
 	if err != nil {
 		o.OK = false
 		o.Error = err.Error()

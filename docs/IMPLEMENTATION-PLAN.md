@@ -113,6 +113,11 @@ Data flow: `reference → loader → session.Session → engine.Replay → Repor
 - **apply_patch:** parse `*** Begin Patch`/`*** End Patch` with add/update/
   delete/move hunks and apply to the working tree (see §7).
 - **subprompts:** see §6.
+- **sandboxing (`--rewrite-dir`):** all absolute paths recorded in the session
+  are remapped into the sandbox dir before executing write/edit/apply_patch
+  and bash `workdir` (see §8.1). Relative-path traversal is rejected. Bash
+  command *text* is not rewritten (matches opencode's own advisory-only
+  external-path handling).
 
 ## 6. Subprompt execution (graceful, behind flag)
 
@@ -169,12 +174,52 @@ implements parsing and application.
 - Skips `.git` and the cache dir itself; symlinks are skipped; unsafe archive
   paths (absolute / `..`) are rejected on restore.
 
+## 8.1 Sandboxing (`--rewrite-dir` / default sandbox)
+
+`internal/replay/rewrite.go` (`Rewriter`):
+
+- Every `run` replays into a sandbox. Location: `--rewrite-dir`/`--dir` if
+  given, otherwise `~/.local/share/determinism/<sanitized name>` (Unix);
+  `<LocalAppData>/determinism`-style path on Windows.
+- `Resolve(p)` maps a recorded path to the sandboxed path:
+  - relative paths → under `TargetDir` (the mirror of `SessionDir`);
+  - absolute paths at/under `SessionDir` → mirrored under `TargetDir`;
+  - sibling paths (under the parent of `SessionDir` but outside it, e.g.
+    `../princess-vpn`) → governed by policy: `--cache` extracts a compressed
+    snapshot (`cache.SiblingKey(unit)`); `--dangerous` returns the real path
+    after per-sibling approval (`--allow-dir` pre-approves); with neither the
+    path is rejected gracefully;
+  - other outside paths, or traversal that escapes the sandbox → error.
+- **Copy-on-first-access:** resolving a session path copies the real file into
+  the sandbox mirror (dirs are created empty) so replay commands can read the
+  session's source. Skipped for dry runs, for `.git`/build/cache directories,
+  non-regular files, and files over 200 MB. The original tree is only ever
+  read, never written.
+- **Command-text rewriting:** `RewriteCommand` rewrites absolute paths inside
+  bash command text (redirects, assignments, quotes, heredocs preserved;
+  heredoc bodies untouched) and escaping-relative sibling refs like
+  `../princess-vpn/x`, so bash executes against the sandbox. System paths
+  (`/dev/null`) are preserved.
+- The engine routes every write/edit/apply_patch target and bash `workdir`
+  through the rewriter when configured; the replay workdir is the sandbox
+  mirror of the session directory.
+- `SyncSiblings` re-snapshots sibling repos touched at their real paths when
+  `--dangerous` and `--cache` are combined, keeping the cache in real-time
+  sync.
+- `--dangerous` prompts for approval (stdin) per missing sibling unless
+  pre-approved or `--dry-run`; a warning is printed when a session references
+  siblings without `--cache`/`--dangerous`.
+- Unit-tested (`rewrite_test.go`, `sandbox_test.go`, `siblings_test.go`):
+  sandbox writes land in the sandbox, the original tree is never touched,
+  out-of-sandbox writes/traversal are rejected, sibling policies behave, and
+  bash reads see the mirrored source.
+
 ## 9. CLI
 
 ```
-determinism run <session|name|prompt|file.md> [--dir P] [--dry-run]
-                 [--subprompts] [--cache] [--cache-dir P] [--strict]
-                 [--db P] [--shell S]
+determinism run <session|name|prompt|file.md> [--dir P] [--rewrite-dir P]
+                 [--dry-run] [--subprompts] [--cache] [--cache-dir P]
+                 [--dangerous] [--allow-dir P] [--strict] [--db P] [--shell S]
 determinism plan <session|...> [--out file.md]      # write implementation plan
 determinism list [--limit n]
 determinism cache save|restore|list|info ...

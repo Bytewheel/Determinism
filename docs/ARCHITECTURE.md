@@ -68,6 +68,31 @@ type Outcome struct {
 4. Failures are collected into the `Report`; replay continues by default
    (`--strict` aborts).
 
+## Path resolution and sandboxing
+
+`Engine.resolvePath` is the single choke point for every path a tool touches
+(bash `workdir`, write/edit targets, apply_patch add/update/delete/move):
+
+- Default: relative paths join `Engine.WorkDir`; absolute paths are honored
+  as recorded.
+- Sandboxed (always on for `run`): a `Rewriter` maps relative paths under the
+  sandbox mirror (`TargetDir`), mirrors absolute paths at/under the session
+  directory into the sandbox, and rejects out-of-session paths and `..`
+  traversal. Replays therefore never write outside the sandbox. Bash command
+  *text* is rewritten too (`Rewriter.RewriteCommand`): absolute paths inside
+  commands, redirect/assignment targets, and escaping-relative sibling refs
+  (`../princess-vpn/x`) are remapped; system paths (`/dev/null`) and heredoc
+  bodies are preserved.
+- The session's files are copied into the sandbox on first access
+  (copy-on-first-access, skipped for dry runs and `.git`/build dirs) so replay
+  can read the original source without touching it. Real paths are never
+  written.
+- Sibling repos (outside the session dir): default reject; `--cache` extracts
+  a gzip-tar snapshot under the sandbox (`<sandbox>/.determinism/siblings/`),
+  created from the real path if absent; `--dangerous` resolves to the real
+  path after per-sibling approval; `--dangerous --cache` keeps the snapshot in
+  real-time sync (`Rewriter.SyncSiblings`).
+
 ## Subprompt resolution
 
 `Loader.Children(parentID)` lists child sessions. A task part's child is

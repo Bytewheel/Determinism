@@ -4,10 +4,13 @@
 package main
 
 import (
+	"bufio"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"bytewheel/determinism/internal/cache"
@@ -45,10 +48,15 @@ A session reference can be:
 Flags:
   --db path          opencode database (default ~/.local/share/opencode/opencode.db)
   --dir path         working directory for replay (default: session directory)
+  --rewrite-dir path sandbox root (default ~/.local/share/determinism/<name>)
+  --cache            snapshot sibling repos into the cache; reference those
+                     snapshots instead of the real paths
+  --cache-dir path   cache directory (default ~/.cache/determinism)
+  --dangerous        access sibling repos at their real absolute paths
+                     (each referenced sibling requires approval)
+  --allow-dir path   pre-approve a sibling dir for --dangerous (repeatable)
   --dry-run          print actions without executing them
   --subprompts       execute subprompts (task/subagent sessions)
-  --cache            enable compressed filesystem/repository caching
-  --cache-dir path   cache directory (default ~/.cache/determinism)
   --strict           stop at the first failure instead of failing gracefully
   --shell path       shell used for bash replay (default /bin/sh)
   --out file         write plan to a file (plan command)
@@ -58,6 +66,7 @@ Flags:
 type opts struct {
 	db         string
 	dir        string
+	rewriteDir string
 	dryRun     bool
 	subprompts bool
 	useCache   bool
@@ -66,6 +75,8 @@ type opts struct {
 	shell      string
 	out        string
 	limit      int
+	dangerous  bool
+	allowDirs  []string
 }
 
 func parseFlags(args []string) (opts, []string, error) {
@@ -85,6 +96,7 @@ func parseFlagSet(args []string) (opts, error) {
 	fs.SetOutput(os.Stderr)
 	fs.StringVar(&o.db, "db", "", "")
 	fs.StringVar(&o.dir, "dir", "", "")
+	fs.StringVar(&o.rewriteDir, "rewrite-dir", "", "")
 	fs.BoolVar(&o.dryRun, "dry-run", false, "")
 	fs.BoolVar(&o.subprompts, "subprompts", false, "")
 	fs.BoolVar(&o.useCache, "cache", false, "")
@@ -93,6 +105,8 @@ func parseFlagSet(args []string) (opts, error) {
 	fs.StringVar(&o.shell, "shell", "", "")
 	fs.StringVar(&o.out, "out", "", "")
 	fs.IntVar(&o.limit, "limit", 50, "")
+	fs.BoolVar(&o.dangerous, "dangerous", false, "")
+	fs.Var(&stringSlice{o: &o.allowDirs}, "allow-dir", "")
 	if err := fs.Parse(args); err != nil {
 		return o, err
 	}
@@ -110,6 +124,8 @@ func splitFlags(args []string) (flags, pos []string, err error) {
 		"-db": true, "-dir": true, "-cache-dir": true, "-shell": true,
 		"-out": true, "-limit": true, "--db": true, "--dir": true,
 		"--cache-dir": true, "--shell": true, "--out": true, "--limit": true,
+		"-rewrite-dir": true, "--rewrite-dir": true,
+		"-allow-dir": true, "--allow-dir": true,
 	}
 	i := 0
 	for i < len(args) {
@@ -239,7 +255,16 @@ func isSlugLike(s string) bool {
 	return true
 }
 
-func newEngine(o opts, ld *session.Loader, s *session.Session) *replay.Engine {
+// stringSlice implements flag.Value for a repeatable string flag.
+type stringSlice struct{ o *[]string }
+
+func (s *stringSlice) String() string { return strings.Join(*s.o, ",") }
+func (s *stringSlice) Set(v string) error {
+	*s.o = append(*s.o, v)
+	return nil
+}
+
+func newEngine(o opts, ld *session.Loader, s *session.Session) (*replay.Engine, error) {
 	e := &replay.Engine{
 		WorkDir:        o.dir,
 		Shell:          o.shell,
@@ -247,6 +272,27 @@ func newEngine(o opts, ld *session.Loader, s *session.Session) *replay.Engine {
 		FailGracefully: !o.strict,
 		DryRun:         o.dryRun,
 		Log:            func(f string, a ...any) { fmt.Fprintf(os.Stdout, f+"\n", a...) },
+	}
+	if o.rewriteDir != "" {
+		rw, err := replay.NewRewriter(s.Directory, o.rewriteDir)
+		if err != nil {
+			return nil, err
+		}
+		rw.Dry = o.dryRun
+		rw.Dangerous = o.dangerous
+		if o.useCache {
+			c, err := cache.New(o.cacheDir)
+			if err != nil {
+				return nil, err
+			}
+			rw.Cache = c
+		}
+		allowed, err := allowedSiblings(o, s, rw)
+		if err != nil {
+			return nil, err
+		}
+		rw.Allowed = allowed
+		e.Rewrite = rw
 	}
 	if ld != nil {
 		e.LoadChild = func(id string) (*session.Session, error) {
@@ -263,7 +309,170 @@ func newEngine(o opts, ld *session.Loader, s *session.Session) *replay.Engine {
 			return ld.FindChild(parentID, description)
 		}
 	}
-	return e
+	return e, nil
+}
+
+// allowedSiblings collects the sibling directories the replay may access at
+// their real paths. --allow-dir pre-approves dirs; anything referenced by the
+// session but not pre-approved is prompted for unless running non-interactively
+// (in which case it is rejected).
+func allowedSiblings(o opts, s *session.Session, rw *replay.Rewriter) (map[string]bool, error) {
+	allowed := map[string]bool{}
+	for _, d := range o.allowDirs {
+		abs, err := filepath.Abs(d)
+		if err != nil {
+			return nil, err
+		}
+		allowed[filepath.Clean(abs)] = true
+	}
+	if !o.dangerous {
+		return allowed, nil
+	}
+	refs := referencedSiblings(s, rw)
+	sort.Strings(refs)
+	var missing []string
+	for _, ref := range refs {
+		if !allowed[ref] {
+			missing = append(missing, ref)
+		}
+	}
+	if len(missing) == 0 {
+		return allowed, nil
+	}
+	if o.dryRun {
+		fmt.Fprintf(os.Stderr, "WARNING: --dangerous: session references sibling dirs not covered by --allow-dir:\n")
+		for _, m := range missing {
+			fmt.Fprintf(os.Stderr, "  %s\n", m)
+		}
+		fmt.Fprintf(os.Stderr, "dry-run; skipping approval prompt\n")
+		return allowed, nil
+	}
+	return promptSiblings(missing, allowed)
+}
+
+// referencedSiblings returns the distinct sibling directories the session
+// touches through bash commands or file tool paths.
+func referencedSiblings(s *session.Session, rw *replay.Rewriter) []string {
+	seen := map[string]bool{}
+	var out []string
+	add := func(p string) {
+		if p == "" || !filepath.IsAbs(p) {
+			return
+		}
+		for _, d := range rw.ReferencedSiblings(p) {
+			if !seen[d] {
+				seen[d] = true
+				out = append(out, d)
+			}
+		}
+	}
+	for _, m := range s.Messages {
+		for _, p := range m.Parts {
+			if p.Type != "tool" {
+				continue
+			}
+			switch p.ToolName {
+			case "bash":
+				var in struct {
+					Command string `json:"command"`
+				}
+				if err := json.Unmarshal(p.Input, &in); err == nil {
+					for _, d := range rw.ReferencedSiblings(in.Command) {
+						if !seen[d] {
+							seen[d] = true
+							out = append(out, d)
+						}
+					}
+				}
+			case "write", "edit":
+				add(toolPath(p.Input))
+			case "apply_patch":
+				for _, d := range rw.ReferencedSiblings(toolPatch(p.Input)) {
+					if !seen[d] {
+						seen[d] = true
+						out = append(out, d)
+					}
+				}
+			}
+		}
+	}
+	return out
+}
+
+func toolPath(raw []byte) string {
+	var in struct {
+		FilePath string `json:"filePath"`
+		Path     string `json:"path"`
+	}
+	if err := json.Unmarshal(raw, &in); err != nil {
+		return ""
+	}
+	if in.FilePath != "" {
+		return in.FilePath
+	}
+	return in.Path
+}
+
+func toolPatch(raw []byte) string {
+	var in struct {
+		PatchText string `json:"patchText"`
+	}
+	if err := json.Unmarshal(raw, &in); err != nil {
+		return ""
+	}
+	return in.PatchText
+}
+
+// promptSiblings asks the user which referenced sibling directories to allow
+// at their real paths under --dangerous.
+func promptSiblings(missing []string, allowed map[string]bool) (map[string]bool, error) {
+	fmt.Fprintln(os.Stderr, "WARNING: --dangerous will access these sibling directories at their REAL paths.")
+	fmt.Fprintln(os.Stderr, "The replay can write to them. Which do you want to allow?")
+	for i, m := range missing {
+		fmt.Fprintf(os.Stderr, "  [%d] %s\n", i+1, m)
+	}
+	fmt.Fprintln(os.Stderr, "Enter numbers (comma-separated), 'all', or 'none':")
+	r := bufio.NewReader(os.Stdin)
+	line, err := r.ReadString('\n')
+	if err != nil && line == "" {
+		return allowed, fmt.Errorf("no input; aborting dangerous access (use --allow-dir to pre-approve)")
+	}
+	line = strings.ToLower(strings.TrimSpace(line))
+	switch line {
+	case "":
+		return allowed, fmt.Errorf("aborting dangerous access (use --allow-dir to pre-approve)")
+	case "all":
+		for _, m := range missing {
+			allowed[m] = true
+		}
+		return allowed, nil
+	case "none":
+		return allowed, nil
+	}
+	for _, tok := range strings.Split(line, ",") {
+		tok = strings.TrimSpace(tok)
+		if tok == "" {
+			continue
+		}
+		var idx int
+		if _, err := fmt.Sscanf(tok, "%d", &idx); err != nil || idx < 1 || idx > len(missing) {
+			continue
+		}
+		allowed[missing[idx-1]] = true
+	}
+	return allowed, nil
+}
+
+// defaultSandboxDir returns the default sandbox root for a session name:
+// ~/.local/share/determinism/<name> on Unix.
+func defaultSandboxDir(name string) string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		home = "."
+	}
+	base := filepath.Join(home, ".local", "share", "determinism")
+	safe := strings.NewReplacer("/", "_", " ", "_", ":", "_", "\\", "_").Replace(name)
+	return filepath.Join(base, safe)
 }
 
 func runPlan(ref string, o opts) error {
@@ -290,9 +499,18 @@ func runReplay(ref string, o opts) error {
 	if err != nil {
 		return err
 	}
-	if o.dir == "" {
-		o.dir = s.Directory
+	if o.rewriteDir == "" && o.dir == "" {
+		name := s.Slug
+		if name == "" {
+			name = s.ID
+		}
+		o.rewriteDir = defaultSandboxDir(name)
 	}
+	if o.rewriteDir == "" {
+		o.rewriteDir = o.dir
+	}
+	// Sandbox mode: the replay workdir IS the sandbox root.
+	o.dir = o.rewriteDir
 	if o.dir != "" {
 		if err := os.MkdirAll(o.dir, 0o755); err != nil {
 			return err
@@ -309,7 +527,27 @@ func runReplay(ref string, o opts) error {
 		defer ld.Close()
 	}
 
-	e := newEngine(o, ld, s)
+	e, err := newEngine(o, ld, s)
+	if err != nil {
+		return err
+	}
+
+	// Warn early when the session references sibling repos that the configured
+	// policy would reject, so the user can decide before running.
+	if e.Rewrite != nil {
+		refs := referencedSiblings(s, e.Rewrite)
+		sort.Strings(refs)
+		for _, ref := range refs {
+			switch {
+			case o.dangerous && e.Rewrite.Allowed[ref]:
+				// approved
+			case o.useCache:
+				// snapshotted
+			default:
+				fmt.Fprintf(os.Stderr, "WARNING: session references sibling %s (outside sandbox) but neither --cache nor --dangerous is set; those actions will fail\n", ref)
+			}
+		}
+	}
 
 	// Compressed filesystem/repository caching: restore a snapshot keyed by the
 	// session before replay so prompts that need pre-existing data get it.

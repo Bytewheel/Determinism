@@ -164,13 +164,24 @@ func stripHeredoc(input string) string {
 
 // ApplyPatch applies parsed hunks to the filesystem rooted at base.
 func ApplyPatch(base string, patchText string) ([]string, error) {
+	return ApplyPatchResolved(base, patchText, func(p string) (string, error) {
+		return resolve(base, p), nil
+	})
+}
+
+// ApplyPatchResolved applies parsed hunks using a custom path resolver, which
+// allows sandboxing (Rewriter) or relocating absolute paths.
+func ApplyPatchResolved(base string, patchText string, resolvePath func(string) (string, error)) ([]string, error) {
 	hunks, err := parsePatch(patchText)
 	if err != nil {
 		return nil, err
 	}
 	var ops []string
 	for _, h := range hunks {
-		src := resolve(base, h.Path)
+		src, err := resolvePath(h.Path)
+		if err != nil {
+			return ops, err
+		}
 		switch h.Type {
 		case "add":
 			if err := os.MkdirAll(filepath.Dir(src), 0o755); err != nil {
@@ -187,7 +198,10 @@ func ApplyPatch(base string, patchText string) ([]string, error) {
 			ops = append(ops, "deleted "+h.Path)
 		case "update":
 			if h.MovePath != "" {
-				dst := resolve(base, h.MovePath)
+				dst, err := resolvePath(h.MovePath)
+				if err != nil {
+					return ops, err
+				}
 				if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 					return ops, err
 				}

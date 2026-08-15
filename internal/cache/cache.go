@@ -45,6 +45,16 @@ func Key(sessionID, workdir, prompt string) string {
 	return hex.EncodeToString(h.Sum(nil))[:32]
 }
 
+// SiblingKey computes a stable cache key for a sibling repository snapshot
+// keyed by its real absolute path.
+func SiblingKey(dir string) string {
+	h := sha256.New()
+	h.Write([]byte("sibling"))
+	h.Write([]byte{0})
+	h.Write([]byte(filepath.Clean(dir)))
+	return hex.EncodeToString(h.Sum(nil))[:32]
+}
+
 func (c *Cache) archivePath(key string) string {
 	return filepath.Join(c.Dir, key+".tar.gz")
 }
